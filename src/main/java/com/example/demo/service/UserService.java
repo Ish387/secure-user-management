@@ -7,6 +7,7 @@ import com.example.demo.exception.DuplicateResourceException;
 import com.example.demo.exception.ResourceNotFoundException;
 import com.example.demo.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -17,6 +18,7 @@ import java.util.List;
 public class UserService {
 
     private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
 
     @Transactional
     public UserResponseDTO createUser(UserRequestDTO requestDTO) {
@@ -27,7 +29,7 @@ public class UserService {
         User user = User.builder()
                 .name(requestDTO.getName())
                 .email(requestDTO.getEmail())
-                .password(requestDTO.getPassword()) // Plain text in Phase 1 — will be hashed in Phase 2
+                .password(passwordEncoder.encode(requestDTO.getPassword()))
                 .build();
 
         User savedUser = userRepository.save(user);
@@ -61,7 +63,7 @@ public class UserService {
 
         existingUser.setName(requestDTO.getName());
         existingUser.setEmail(requestDTO.getEmail());
-        existingUser.setPassword(requestDTO.getPassword()); // Plain text in Phase 1
+        existingUser.setPassword(passwordEncoder.encode(requestDTO.getPassword()));
 
         User updatedUser = userRepository.save(existingUser);
         return mapToResponseDTO(updatedUser);
