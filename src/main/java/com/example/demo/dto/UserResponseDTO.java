@@ -7,6 +7,10 @@ import lombok.NoArgsConstructor;
 
 import java.time.LocalDateTime;
 
+/**
+ * DTO for user API responses.
+ * Deliberately excludes the password field to prevent sensitive data exposure.
+ */
 @Data
 @NoArgsConstructor
 @AllArgsConstructor

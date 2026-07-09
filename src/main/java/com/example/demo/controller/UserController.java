@@ -11,6 +11,10 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 
+/**
+ * REST controller for User CRUD operations. All endpoints are protected (require JWT).
+ * Contains no business logic — delegates entirely to UserService.
+ */
 @RestController
 @RequestMapping("/api/users")
 @RequiredArgsConstructor

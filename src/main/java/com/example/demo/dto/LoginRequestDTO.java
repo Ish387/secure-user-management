@@ -3,22 +3,16 @@ package com.example.demo.dto;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import lombok.AllArgsConstructor;
-import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
 /**
- * DTO for user creation and update requests.
- * Includes validation constraints; password is accepted here but never returned in responses.
+ * DTO for login requests. Uses email as the authentication identifier.
  */
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-@Builder
-public class UserRequestDTO {
-
-    @NotBlank(message = "Name is required")
-    private String name;
+public class LoginRequestDTO {
 
     @NotBlank(message = "Email is required")
     @Email(message = "Email must be valid")

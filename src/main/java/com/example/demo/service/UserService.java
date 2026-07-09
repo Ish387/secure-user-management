@@ -13,6 +13,10 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 
+/**
+ * Service layer for User CRUD operations.
+ * Contains all business logic — controllers delegate here without any logic of their own.
+ */
 @Service
 @RequiredArgsConstructor
 public class UserService {

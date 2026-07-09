@@ -10,6 +10,10 @@ import org.hibernate.annotations.UpdateTimestamp;
 
 import java.time.LocalDateTime;
 
+/**
+ * JPA entity representing a user in the system.
+ * Maps to the "users" table. Timestamps are auto-managed by Hibernate.
+ */
 @Entity
 @Table(name = "users")
 @Data
