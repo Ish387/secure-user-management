@@ -1,5 +1,6 @@
 package com.example.demo.controller;
 
+import com.example.demo.config.AppConfig;
 import com.example.demo.config.SecurityConfig;
 
 import com.example.demo.dto.UserRequestDTO;
@@ -32,7 +33,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 @WebMvcTest(UserController.class)
-@Import({SecurityConfig.class, JwtAuthenticationFilter.class, JwtAuthEntryPoint.class})
+@Import({SecurityConfig.class, JwtAuthenticationFilter.class, JwtAuthEntryPoint.class, AppConfig.class})
 class UserControllerTest {
 
     @Autowired
@@ -138,5 +139,17 @@ class UserControllerTest {
     void accessWithoutAuth_Returns401() throws Exception {
         mockMvc.perform(get("/api/users"))
                 .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @WithMockUser
+    void getUserById_NotFound_SinhalaAcceptLanguage_ReturnsLocalizedMessage() throws Exception {
+        when(userService.getUserById(999L))
+                .thenThrow(new ResourceNotFoundException("User", "id", 999L));
+
+        mockMvc.perform(get("/api/users/999").header("Accept-Language", "si"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.message", org.hamcrest.Matchers.containsString("පරිශීලකයා")))
+                .andExpect(jsonPath("$.message", org.hamcrest.Matchers.containsString("හමු නොවීය")));
     }
 }

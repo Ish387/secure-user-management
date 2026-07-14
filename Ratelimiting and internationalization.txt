@@ -1,0 +1,1812 @@
+╭─── Claude Code v2.1.207 ─────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting        │
+│                 Welcome back Ishan!                │ started                 │
+│                                                    │ Run /init to create a … │
+│                       ▐▛███▜▌                      │ ─────────────────────── │
+│                      ▝▜█████▛▘                     │ What's new              │
+│                        ▘▘ ▝▝                       │ Auto mode is now avail… │
+│   Sonnet 5 · Claude Pro · bodima152@gmail.com's    │ Fixed the terminal fre… │
+│   Organization                                     │ Fixed remote managed s… │
+│         ~\Documents\secure-user-management         │ /release-notes for more │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+ ▎ Extended through July 19
+ ▎ We're extending Claude Fable 5 access on all paid plans, as well as keeping Claude Code’s weekly rate limits 50% higher, through July 19.
+ ▎
+ ▎ As before, you can use up to half of your weekly usage limit on Fable 5. After that, you can keep using Fable 5 with usage credits, or switch to another model to keep working within your remaining limits.
+ ▎
+ ▎ More details here: https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access
+
+● Now I'll walk through the theory and each piece of code in plain terms.
+
+  The theory: fixed-window rate limiting
+
+  Think of it like a bouncer with a stopwatch and a clicker counter, one per
+  visitor (IP address):
+
+  1. When a request arrives from IP 1.2.3.4, check: has 60 seconds passed since
+  I last reset this IP's counter?
+  2. If yes (or it's a brand-new IP) → reset counter to 1, start the clock now.
+  3. If no → bump the counter by 1.
+  4. If the counter is now over the allowed max (5) → reject with 429 Too Many 
+  Requests. Otherwise let the request through.
+
+  This is called fixed-window because the 60-second window is a fixed clock slot
+  (e.g. 00:00–01:00, 01:00–02:00), not a rolling window that follows each
+  individual request. The one quirk: right at the boundary between two windows,
+  a client could squeeze in 5 requests just before the window flips and another
+  5 right after — briefly 10 in ~1 second instead of 5 in 60. That's a known,
+  accepted trade-off for how simple it is to build and reason about — good
+  enough for stopping brute-force login attempts, not meant to be perfectly
+  precise.
+
+  Everything else in the design serves that one idea: where to intercept the
+  request, how to store counters safely when multiple requests arrive at once,
+  how to identify "who" is calling, and how to clean up so memory doesn't grow
+  forever.
+
+  ---
+  File by file
+
+  RateLimitingFilter.java — the bouncer itself
+
+  This is a servlet filter — code that runs on every incoming HTTP request
+  before it reaches your controller, similar to airport security before you
+  reach the gate.
+
+  public class RateLimitingFilter extends OncePerRequestFilter {
+  OncePerRequestFilter is a Spring helper base class guaranteeing your filter
+  logic runs exactly once per request (some server setups can otherwise
+  re-dispatch a request internally and run filters twice).
+
+  private final ConcurrentHashMap<String, RequestCounter> countersByIp = new
+  ConcurrentHashMap<>();
+  This is the "clicker per visitor" — a map from IP address string → their
+  current counter. ConcurrentHashMap specifically because multiple requests can
+  hit the server at the same instant from different threads; a plain HashMap
+  isn't safe under concurrent access and could corrupt itself or lose updates.
+
+  public RateLimitingFilter(
+          @Value("${rate-limit.auth.max-requests}") int maxRequests,
+          @Value("${rate-limit.auth.window-ms}") long windowMs,
+          @Value("${rate-limit.trust-forwarded-header:false}") boolean
+  trustForwardedHeader,
+          ObjectMapper objectMapper,
+          Clock clock) {
+  @Value("${...}") pulls a number straight out of application.properties (e.g.
+  rate-limit.auth.max-requests=5) and hands it to the constructor — so you can
+  tune the limit without touching code. ObjectMapper (Jackson's JSON converter)
+  and Clock (a wrapper around "what time is it") are injected as normal Spring
+  beans, not properties, because they're full objects, not simple values.
+
+  Why inject Clock instead of just calling System.currentTimeMillis() directly?
+  So tests can fake time. A real clock ticks in real time — you can't easily
+  unit-test "wait 60 seconds" without actually waiting. By depending on an
+  abstract Clock, the test swaps in a fake one it can fast-forward instantly.
+
+  protected boolean shouldNotFilter(@NonNull HttpServletRequest request) {
+      return !PATH_MATCHER.match(SecurityConfig.AUTH_PATH_PATTERN,
+  request.getRequestURI());
+  }
+  This is the "only check ID at this specific gate" logic. shouldNotFilter is a
+  hook OncePerRequestFilter gives you to skip the filter's work entirely for
+  requests you don't care about. Here: if the URL isn't /api/auth/..., skip rate
+  limiting completely (so browsing /api/users isn't throttled).
+
+  RequestCounter counter = countersByIp.compute(ip, (key, existing) -> {
+      if (existing == null || now - existing.windowStart >= windowMs) {
+          return new RequestCounter(now, 1);
+      }
+      existing.count++;
+      return existing;
+  });
+  This is the actual "click the counter" step, and it's the trickiest bit.
+  .compute() is an atomic operation — it looks up the key, runs your logic, and
+  stores the result, all as one indivisible step, so two simultaneous requests
+  from the same IP can't both read "count = 4" and both write back "count = 5"
+  (losing one increment). The logic inside says: no counter yet, or the old
+  window is stale (more than windowMs has passed) → start fresh at 1. Otherwise
+  → same window, add one.
+
+  if (counter.count > maxRequests) {
+      long retryAfterSeconds = Math.max(1, (long) Math.ceil((counter.windowStart
+  + windowMs - now) / 1000.0));
+      writeTooManyRequests(response, retryAfterSeconds);
+      return;
+  }
+  filterChain.doFilter(request, response);
+  If over the limit: compute how many seconds remain until the window resets
+  (windowStart + windowMs is when the window ends), write the 429 response, and
+  return without calling filterChain.doFilter(...) — that's the equivalent of
+  the bouncer physically not letting you through the door. If under the limit,
+  filterChain.doFilter(...) passes the request along to the next
+  filter/controller, business as usual.
+
+  private String resolveClientIp(HttpServletRequest request) {
+      if (trustForwardedHeader) {
+          String forwardedFor = request.getHeader("X-Forwarded-For");
+          if (StringUtils.hasText(forwardedFor)) {
+              return forwardedFor.split(",")[0].trim();
+          }
+      }
+      return request.getRemoteAddr();
+  }
+  "Who is calling?" getRemoteAddr() is the TCP-connection-level IP — always
+  trustworthy, but if you put a reverse proxy (nginx, a load balancer) in front
+  of your app later, every request will appear to come from the proxy's own IP,
+  not the real visitor. Proxies solve this by adding an X-Forwarded-For header
+  with the real visitor's IP. But that header is just text anyone can set
+  themselves — a client could fake it to dodge the limiter. So it's only honored
+  if you explicitly flip rate-limit.trust-forwarded-header=true, which you'd
+  only do once you know a trusted proxy is the one actually setting that header.
+
+  private void writeTooManyRequests(HttpServletResponse response, long
+  retryAfterSeconds) throws IOException {
+      response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
+      response.setHeader("Retry-After", String.valueOf(retryAfterSeconds));
+      response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+      ErrorResponse error = new ErrorResponse(429, "Too many requests...",
+  LocalDateTime.now(clock));
+      objectMapper.writeValue(response.getWriter(), error);
+  }
+  Manually building the HTTP response. This has to be done by hand (rather than
+  just throwing an exception like a controller normally would) because filters
+  run outside Spring MVC's normal exception-handling machinery
+  (GlobalExceptionHandler never sees anything that happens in a filter).
+  Retry-After is a standard HTTP header telling a well-behaved client "don't
+  bother retrying for N more seconds." objectMapper.writeValue(...) serializes
+  the ErrorResponse record straight to JSON text into the response body, reusing
+  the app's existing error shape.
+
+  @Scheduled(fixedRateString = "${rate-limit.cleanup-interval-ms:300000}")
+  void purgeExpiredCounters() {
+      long now = clock.millis();
+      countersByIp.entrySet().removeIf(entry -> now -
+  entry.getValue().windowStart > windowMs * 2);
+  }
+  The garbage collector for old visitors. Without this, every unique IP that
+  ever hits /api/auth/** would sit in the map forever, growing unbounded — a
+  slow memory leak. @Scheduled tells Spring "run this method automatically every
+  N milliseconds" (here every 5 minutes by default). It removes entries whose
+  window ended more than twice the window length ago — the 2x buffer is just a
+  safety margin so we never accidentally wipe a counter mid-use.
+
+  private static final class RequestCounter {
+      private final long windowStart;
+      private volatile int count;
+  A tiny plain data holder: when this window started, and how many hits so far.
+  volatile on count ensures that when one thread increments it, other threads
+  immediately see the new value rather than a stale cached copy — necessary
+  because compute() synchronizes the map update itself, but reading
+  counter.count afterward (in the if (counter.count > maxRequests) check)
+  happens outside that lock.
+
+  ---
+  SecurityConfig.java — plugging the bouncer into the building
+
+  public static final String AUTH_PATH_PATTERN = "/api/auth/**";
+  ...
+  .requestMatchers(AUTH_PATH_PATTERN).permitAll()
+  One constant reused in two places, so the "which URLs are the auth endpoints"
+  definition can't drift out of sync between the security rule and the rate
+  limiter's own path check.
+
+  .addFilterBefore(jwtAuthenticationFilter,
+  UsernamePasswordAuthenticationFilter.class)
+  .addFilterBefore(rateLimitingFilter, JwtAuthenticationFilter.class);
+  Spring Security's filter chain is an ordered pipeline — addFilterBefore(X, 
+  Y.class) says "insert X right before Y." Order here matters twice over:
+  1. Logically: rate limiting should happen first, before any JWT
+  parsing/validation work, so an attacker gets rejected cheaply and early rather
+  than making the server do more work per rejected request.
+  2. Mechanically: Spring needs to already know where JwtAuthenticationFilter
+  sits before you can say "put something before it" — that's why the two lines
+  are in this specific order (register JWT's position first, then anchor the
+  rate limiter to it).
+
+  ---
+  AppConfig.java — why Clock lives here, not in SecurityConfig
+
+  @Bean
+  public Clock clock() {
+      return Clock.systemUTC();
+  }
+  Simple on its own, but the reason it's a separate file is the interesting
+  part: SecurityConfig needs RateLimitingFilter (to register it), and
+  RateLimitingFilter needs Clock. If Clock had stayed defined inside
+  SecurityConfig, you'd get a loop — to build SecurityConfig, first build 
+  RateLimitingFilter, which needs Clock, which is a method on SecurityConfig, 
+  which isn't built yet — a circular dependency Spring can't resolve. Moving
+  Clock to its own independent class breaks that cycle.
+
+  ---
+  In one sentence: every request to /api/auth/** first passes through a per-IP
+  click-counter; if a given IP clicks past 5 within 60 seconds, it gets turned
+  away with a 429 and a "try again in N seconds" header, and stale counters get
+  swept away every 5 minutes so the map doesn't grow forever.
+
+✻ Baked for 45s
+
+❯ /compact                                                                      
+  ⎿  Compacted (ctrl+o to see full summary)
+  ⎿  Read src\main\java\com\example\demo\config\AppConfig.java (20 lines)
+  ⎿  Read src\main\java\com\example\demo\security\RateLimitingFilter.java (127 
+     lines)
+  ⎿  Read src\test\java\com\example\demo\controller\UserControllerTest.java (144
+     lines)
+  ⎿  Read src\main\resources\application.properties (28 lines)
+  ⎿  Read src\test\java\com\example\demo\controller\AuthControllerTest.java (122
+     lines)
+  ⎿  Plan file referenced (~\.claude\plans\vivid-dazzling-kitten.md)
+  ⎿  Skills restored (doctor)
+
+❯ I need to implement the internationalization in my project. According to my   
+  knowlegde it is like giving the user the error messages, text and other stuff 
+  according to the language that he has selected at the start of the program.   
+  Actually in my case this is only the backend. Shall we implement this feature 
+
+● Explore(Explore i18n-relevant code paths)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+● I've kicked off an exploration of how error messages and user-facing text
+  currently work in the project (exception handlers, validation annotations,
+  hardcoded strings) to figure out exactly what needs to be externalized for
+  i18n. I'll follow up once that comes back with a concrete plan.
+
+  Quick confirmation on your understanding: yes, that's right — i18n means
+  serving the same content (error messages, validation messages, etc.) in
+  different languages depending on what the client requests. For an API-only
+  backend, this is typically driven by the Accept-Language HTTP header instead
+  of a UI language picker.
+
+✻ Churned for 24s
+
+● Agent "Explore i18n-relevant code paths" finished · 55s
+
+● User answered Claude's questions:
+  ⎿  · Which languages should the API support to start with (besides English as 
+     the default/fallback)? → English + Sinhala
+     · Messages like "User not found with id: '5'" embed English words like 
+     "User" and "id" inside the sentence. Should those nouns be translated too, 
+     or left as-is? → Translate everything (recommended)
+
+● User answered Claude's questions:
+  ⎿  · Since this is a stateless JWT API with no server-side session, how should
+     the backend know which language a request wants? → Accept-Language header 
+     (recommended)
+
+● Plan(Design i18n implementation plan)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+● Locale source, languages (English + Sinhala), and noun-translation scope are
+  settled. I've handed the detailed design work to a planning agent — it'll come
+  back with the exact message-bundle keys, file-by-file changes, and a
+  verification plan. I'll write the final plan once that's done.
+
+✻ Cooked for 2m 39s
+
+● Agent "Design i18n implementation plan" finished · 6m 42s
+
+  Read 2 files (ctrl+o to expand)
+
+● Updated plan
+  ⎿  Error writing file
+
+  Read 1 file (ctrl+o to expand)
+
+● Now writing the new plan (replacing the completed rate-limiting plan with this
+  feature's plan).
+● Updated plan
+  ⎿  /plan to preview
+
+● User approved Claude's plan
+  ⎿  Plan saved to: ~\.claude\plans\vivid-dazzling-kitten.md · /plan to edit
+     Internationalization (i18n) for error/validation messages
+
+     Context
+
+     The API currently returns every error/validation message as a hardcoded
+     English string (in GlobalExceptionHandler, the two resource exceptions, the
+     DTO validation annotations, JwtAuthEntryPoint, and RateLimitingFilter).
+     There is zero i18n infrastructure today — no messages*.properties, no
+     MessageSource/LocaleResolver. We're adding support for serving localized
+     messages based on the client's Accept-Language header (confirmed with user
+     — standard REST convention, works for a stateless JWT API with no
+     server-side session, including pre-login requests). Confirmed scope:
+     support English (default/fallback) + Sinhala (si) at launch, and translate
+     embedded English nouns too (e.g. "User", "id", "email" inside "User not
+     found with id: '5'"), with automatic fallback to the raw English word if a
+     translation entry is ever missing.
+
+     Spring Boot autoconfigures both the MessageSource bean (reads
+     classpath:messages*.properties) and the MVC LocaleResolver
+     (AcceptHeaderLocaleResolver, reads Accept-Language) purely from
+     application.properties — no new @Configuration/@Bean class is needed.
+     Confirmed @WebMvcTest slices already import MessageSourceAutoConfiguration,
+     so existing controller tests keep a working MessageSource with no extra
+     test wiring.
+
+     One layering wrinkle: JwtAuthEntryPoint and RateLimitingFilter are plain
+     servlet filters that run before DispatcherServlet, so Spring's MVC-resolved
+     Locale/LocaleContextHolder isn't populated yet when they execute. Those
+     two must resolve locale via HttpServletRequest.getLocale()
+     (servlet-container-level Accept-Language parsing) instead.
+
+     Key design points
+
+     - Never throw NoSuchMessageException. Every messageSource.getMessage(...)
+     call uses the 4-arg overload getMessage(code, args, defaultMessage, 
+     locale), passing today's hardcoded English string as defaultMessage. This
+     is what gives the "fallback to raw English noun" behavior, and also
+     protects against our own typos/missing keys degrading to English instead of
+     a 500.
+     - Key naming: validation.* (Bean Validation messages), entity.*/field.*
+     (noun lookup table, keyed by rawWord.toLowerCase()), error.* (everything
+     else).
+     - GlobalExceptionHandler gets a Locale locale parameter added to each
+     @ExceptionHandler method (Spring's exception-handling argument resolution
+     supports Locale natively, same as regular controller methods) rather than
+     reading LocaleContextHolder inside the body — easier to unit-test
+     deterministically.
+     - ResourceNotFoundException/DuplicateResourceException keep their existing
+     super(String.format(...)) call (so .getMessage() stays a stable English
+     string for logs) but also expose resourceName/fieldName/fieldValue via
+     getters, so the handler can independently build a localized message,
+     translating the nouns via entity.*/field.* lookups.
+     - handleValidationErrors additionally translates fieldError.getField()
+     (e.g. "email") via the same field.* table when building its joined message;
+     fieldError.getDefaultMessage() is already localized automatically once DTO
+     annotations use {validation.xxx} codes.
+     - JwtAuthEntryPoint: drop the raw authException.getMessage() interpolation
+     (that string comes from Spring Security internals, always English, and
+     concatenating it into an otherwise-localized sentence would look broken and
+     leak internal detail). Replace with a flat error.unauthorized key. Also
+     fixes a pre-existing wart while we're in there: hand-rolled String.format
+     JSON → proper ErrorResponse + injected ObjectMapper (matches how
+     RateLimitingFilter already does it) — safer than manual string/JSON
+     escaping.
+     - MessageFormat quoting gotcha: the resource-not-found/already-exists
+     templates use {2} inside literal single quotes for the field value, e.g.
+     "{0} not found with {1}: '{2}'". In MessageFormat syntax (which
+     getMessage(code, args, ...) uses under the hood), a single quote is an
+     escape char — '{2}' would render as literal text {2}, NOT the substituted
+     value. Must double the quotes in the property file:
+     error.resource.not-found={0} not found with {1}: ''{2}''.
+     - Encoding: spring.messages.encoding=UTF-8 (set explicitly even though it's
+     already the default) — the real risk is messages_si.properties must be
+     saved as UTF-8 on disk, or the Sinhala glyphs get silently mangled.
+     - Sinhala strings below are a best-effort translation to unblock
+     implementation, not verified by a native speaker — flagged for a
+     native-speaker review pass before shipping.
+
+     Files to create / modify
+
+     1. src/main/resources/messages.properties (new — English/default bundle)
+
+     Keys: validation.name.required, validation.email.required,
+     validation.email.invalid, validation.password.required, entity.user,
+     field.id, field.email, field.name, field.password,
+     error.resource.not-found, error.resource.already-exists,
+     error.auth.bad-credentials, error.unauthorized, error.rate-limit.exceeded,
+     error.generic — values equal to today's exact hardcoded English strings (so
+     default-locale behavior is byte-identical to current output). Resource
+     templates use doubled single-quotes per the MessageFormat gotcha above.
+
+     2. src/main/resources/messages_si.properties (new — Sinhala bundle)
+
+     Same key set, Sinhala values (e.g. entity.user=පරිශීලකයා,
+     error.auth.bad-credentials=වලංගු නොවන විද්‍යුත් තැපෑල හෝ මුරපදය, etc.) —
+     full key/value list to be written during implementation, saved as UTF-8.
+
+     3. src/main/resources/application.properties (modify)
+
+     Add:
+     spring.messages.basename=messages
+     spring.messages.encoding=UTF-8
+     spring.messages.fallback-to-system-locale=false
+     spring.web.locale=en
+     spring.web.locale-resolver=accept-header
+     fallback-to-system-locale=false is the important one — makes
+     messages.properties the deterministic fallback for any unsupported
+     Accept-Language (e.g. fr), independent of the deployment host's JVM locale.
+
+     4. src/main/java/com/example/demo/exception/ResourceNotFoundException.java 
+     and DuplicateResourceException.java (modify)
+
+     Add resourceName/fieldName/fieldValue fields + getters, keep existing
+     super(String.format(...)) unchanged.
+
+     5. src/main/java/com/example/demo/exception/GlobalExceptionHandler.java 
+     (modify)
+
+     Constructor-inject MessageSource. Add private resolveNoun(String prefix, 
+     String rawWord, Locale locale) helper (messageSource.getMessage(prefix + 
+     "." + rawWord.toLowerCase(), null, rawWord, locale)). Add Locale locale
+     param to all 5 @ExceptionHandler methods; replace each hardcoded literal /
+     ex.getMessage() usage with a messageSource.getMessage(code, args, 
+     defaultMessage, locale) call as detailed in the design points.
+
+     6. src/main/java/com/example/demo/security/JwtAuthEntryPoint.java (modify)
+
+     Constructor-inject MessageSource and ObjectMapper. In commence(...),
+     resolve Locale via request.getLocale(), look up error.unauthorized, build
+     an ErrorResponse, serialize via objectMapper.writeValue(...) instead of
+     manual JSON string formatting.
+
+     7. src/main/java/com/example/demo/security/RateLimitingFilter.java (modify)
+
+     Add MessageSource as a constructor parameter. Thread request into
+     writeTooManyRequests(...), resolve Locale via request.getLocale(), replace
+     the hardcoded literal with
+     messageSource.getMessage("error.rate-limit.exceeded", null, "Too many 
+     requests. Please try again later.", locale).
+
+     8. src/main/java/com/example/demo/dto/UserRequestDTO.java and 
+     LoginRequestDTO.java (modify)
+
+     Change each message = "..." literal to the matching message = 
+     "{validation.xxx}" code (e.g. @NotBlank(message = 
+     "{validation.name.required}")). No other changes — Spring Boot's
+     autoconfigured Bean Validation already wires the validator's message
+     interpolator to the app's MessageSource.
+
+     9. Test updates (mechanical, required for compilation)
+
+     - src/test/java/com/example/demo/exception/GlobalExceptionHandlerTest.java:
+     currently does new GlobalExceptionHandler() and calls handlers with no
+     Locale arg — won't compile once those change. Update to construct a real
+     ResourceBundleMessageSource (basename "messages") and pass Locale.ENGLISH
+     explicitly to each call; existing assertions should hold verbatim under
+     English. Add new cases passing Locale.forLanguageTag("si") asserting
+     Sinhala text appears.
+     - src/test/java/com/example/demo/security/RateLimitingFilterTest.java:
+     update all new RateLimitingFilter(...) call sites to pass a MessageSource
+     (same ResourceBundleMessageSource pattern). Existing assertions only check
+     assertNotNull(body.message), not exact text, so no assertion changes needed
+     there — add one new case with Accept-Language: si asserting the Sinhala
+     rate-limit message.
+     - AuthControllerTest.java / UserControllerTest.java: no changes required
+     for existing cases (status-code-only assertions, default locale
+     unaffected). Add a few new @Test cases sending .header("Accept-Language", 
+     "si") on representative error paths (e.g. 404 on missing user, 400 on
+     invalid register payload) asserting Sinhala text, plus one with
+     Accept-Language: fr asserting fallback to English.
+     - Optional new JwtAuthEntryPointTest.java (none exists today): unit-test
+     commence(...) with a MockHttpServletRequest carrying Accept-Language: si vs
+     no header, asserting the serialized message field.
+
+     Verification
+
+     - mvnw test — full suite passes; confirm default-locale (no header)
+     responses are byte-identical to today's hardcoded strings.
+     - New Sinhala-specific test cases (above) pass.
+     - Manual curl checks with and without Accept-Language: si, plus one with an
+     unsupported locale (fr) to confirm English fallback, covering:
+     resource-not-found, validation error, bad-credentials login,
+     unauthenticated request (JwtAuthEntryPoint), and rate-limit 429
+     (RateLimitingFilter).
+     - mvnw verify for JaCoCo coverage on the modified/new code paths.
+
+  Read 6 files (ctrl+o to expand)
+  ⎿  Invalid tool parameters
+
+● I'll skip the formal task list overhead and proceed directly with
+  implementation.
+
+● Write(src\main\resources\messages.properties)
+  ⎿  Wrote 26 lines to src\main\resources\messages.properties
+       1 # Bean Validation messages (referenced from DTO annotations via 
+         {code})
+       2 validation.name.required=Name is required
+       4 validation.email.invalid=Email must be valid
+       5 validation.password.required=Password is required
+       6 
+       7 # Noun translation table: lowercase(word) -> localized noun, wit
+         h English fallback
+       9 field.id=id
+      10 field.email=email
+     … +19 lines (ctrl+o to expand)
+
+● Write(src\main\resources\messages_si.properties)
+  ⎿  Wrote 26 lines to src\main\resources\messages_si.properties
+       1 # Bean Validation messages
+       2 validation.name.required=නම අවශ්‍යයි
+       3 validation.email.required=විද්‍යුත් තෑපෝල අවශ්‍යයි
+       4 validation.email.invalid=වලංගු විද්‍යුත් තෑපෝලක් වස් යුතුය
+       5 validation.password.required=මුරපදය අවශ්‍යයි
+       6 
+       7 # Noun translation table
+       8 entity.user=පරිශෟලකයා
+       9 field.id=හීනුමුම්පත
+      10 field.email=විද්‍යුත් තෑපෝල
+     … +18 lines (ctrl+o to expand)
+
+● Let me rewrite that file — I introduced some garbled escape sequences by
+  mistake.
+
+  Read 1 file (ctrl+o to expand)
+
+● Write(src\main\resources\messages_si.properties)
+  ⎿  Added 11 lines, removed 11 lines
+       1  # Bean Validation messages
+       2  validation.name.required=නම අවශ්‍යයි
+       3 -validation.email.required=විද්‍යුත් තෑපෝල අවශ්‍යයි               
+       4 -validation.email.invalid=වලංගු විද්‍යුත් තෑපෝලක් වස් යුතුය      
+       3 +validation.email.required=විද්‍යුත් තැපෑල අවශ්‍යයි               
+       4 +validation.email.invalid=වලංගු විද්‍යුත් තැපෑලක් විය යුතුය      
+       5  validation.password.required=මුරපදය අවශ්‍යයි
+       6  
+       7  # Noun translation table
+       8 -entity.user=පරිශෟලකයා                                          
+       9 -field.id=හීනුමුම්පත                                            
+      10 -field.email=විද්‍යුත් තෑපෝල                                     
+       8 +entity.user=පරිශීලකයා                                          
+       9 +field.id=හැඳුනුම්පත                                            
+      10 +field.email=විද්‍යුත් තැපෑල                                     
+      11  field.name=නම
+      12  field.password=මුරපදය
+      13  
+      14 -# Resource exception templates                                 
+      15 -error.resource.not-found={1}: ''{2}'' සදහිල {0} හමු නොවීය      
+      16 -error.resource.already-exists={1}: ''{2}'' සදහිල {0} ද\u0DDැනටම
+         -ත් පවතී                                                        
+      14 +# Resource exception templates ({0}=entity noun, {1}=field noun
+         +, {2}=raw field value)                                         
+      15 +error.resource.not-found={1}: ''{2}'' සහිත {0} හමු නොවීය       
+      16 +error.resource.already-exists={1}: ''{2}'' සහිත {0} දැනටමත් පවත
+         +ී                                                              
+      17  
+      18  # Auth / security
+      19 -error.auth.bad-credentials=වලංගු නොන විද්‍යුත් තෑපෝල හෝ මුරප\u0D
+         -Аdය                                                            
+      19 +error.auth.bad-credentials=වලංගු නොවන විද්‍යුත් තැපෑල හෝ මුරපදය 
+      20  error.unauthorized=අනවසර ප්‍රවේශයකි
+      21  
+      22  # Rate limiting
+      23 -error.rate-limit.exceeded=ඉල්ල\u0DДම් ඉතා ව\u0DДඩ\u0DДය. කරුනාක
+         -ර පසුවට න\u0DДවත උත්සාහ කරන්න.                                 
+      23 +error.rate-limit.exceeded=ඉල්ලීම් ඉතා වැඩිය. කරුණාකර පසුව නැවත 
+         +උත්සාහ කරන්න.                                                  
+      24  
+      25  # Generic fallback
+      26 -error.generic=අනපේක්ෂිත දෝෂයක් සිදු වී                         
+      26 +error.generic=අනපේක්ෂිත දෝෂයක් සිදු විය                        
+
+  Read 1 file (ctrl+o to expand)
+
+● Good, clean now. Next, update application.properties.
+
+● Update(src\main\resources\application.properties)
+  ⎿  Added 9 lines, removed 1 line
+      25  # Only set to true once a reverse proxy/load balancer sits in f
+          ront of this app AND
+      26  # that proxy strips/overwrites any client-supplied X-Forwarded-
+          For with its own value.
+      27  rate-limit.trust-forwarded-header=false
+      28 -rate-limit.cleanup-interval-ms=300000                          
+      28   No newline at end of file
+      29 +rate-limit.cleanup-interval-ms=300000                          
+      30 +                                                               
+      31 +# Internationalization (i18n): locale is driven by the Accept-L
+         +anguage request header.                                        
+      32 +# Supported bundles: messages.properties (English, default/fall
+         +back), messages_si.properties (Sinhala).                       
+      33 +spring.messages.basename=messages                              
+      34 +spring.messages.encoding=UTF-8                                 
+      35 +spring.messages.fallback-to-system-locale=false                
+      36 +spring.web.locale=en                                           
+      37 +spring.web.locale-resolver=accept-header                       
+      38   No newline at end of file
+
+● Now the exception classes:
+
+● Write(src\main\java\com\example\demo\exception\ResourceNotFoundException.java)
+  ⎿  Added 19 lines
+       3  /** Thrown when a requested resource (e.g., User) is not found.
+           Results in HTTP 404. */
+       4  public class ResourceNotFoundException extends RuntimeException
+           {
+       5  
+       6 +    private final String resourceName;                         
+       7 +    private final String fieldName;                            
+       8 +    private final Object fieldValue;                           
+       9 +                                                               
+      10      public ResourceNotFoundException(String resourceName, Strin
+          g fieldName, Object fieldValue) {
+      11          super(String.format("%s not found with %s: '%s'", resou
+          rceName, fieldName, fieldValue));
+      12 +        this.resourceName = resourceName;                      
+      13 +        this.fieldName = fieldName;                            
+      14 +        this.fieldValue = fieldValue;                          
+      15      }
+      16 +                                                               
+      17 +    public String getResourceName() {                          
+      18 +        return resourceName;                                   
+      19 +    }                                                          
+      20 +                                                               
+      21 +    public String getFieldName() {                             
+      22 +        return fieldName;                                      
+      23 +    }                                                          
+      24 +                                                               
+      25 +    public Object getFieldValue() {                            
+      26 +        return fieldValue;                                     
+      27 +    }                                                          
+      28  }
+
+● Write(src\main\java\com\example\demo\exception\DuplicateResourceException.java
+       )
+  ⎿  Added 19 lines
+       3  /** Thrown when a resource with a conflicting unique field (e.g
+          ., email) already exists. Results in HTTP 409. */
+       4  public class DuplicateResourceException extends RuntimeExceptio
+          n {
+       5  
+       6 +    private final String resourceName;                         
+       7 +    private final String fieldName;                            
+       8 +    private final Object fieldValue;                           
+       9 +                                                               
+      10      public DuplicateResourceException(String resourceName, Stri
+          ng fieldName, Object fieldValue) {
+      11          super(String.format("%s already exists with %s: '%s'", 
+          resourceName, fieldName, fieldValue));
+      12 +        this.resourceName = resourceName;                      
+      13 +        this.fieldName = fieldName;                            
+      14 +        this.fieldValue = fieldValue;                          
+      15      }
+      16 +                                                               
+      17 +    public String getResourceName() {                          
+      18 +        return resourceName;                                   
+      19 +    }                                                          
+      20 +                                                               
+      21 +    public String getFieldName() {                             
+      22 +        return fieldName;                                      
+      23 +    }                                                          
+      24 +                                                               
+      25 +    public Object getFieldValue() {                            
+      26 +        return fieldValue;                                     
+      27 +    }                                                          
+      28  }
+
+● Now GlobalExceptionHandler:
+
+● Write(src\main\java\com\example\demo\exception\GlobalExceptionHandler.java)
+  ⎿  Added 48 lines, removed 11 lines
+      1  package com.example.demo.exception;
+      2  
+      3 +import org.springframework.context.MessageSource;               
+      4  import org.springframework.http.HttpStatus;
+      5  import org.springframework.http.ResponseEntity;
+      6  import org.springframework.security.authentication.BadCredential
+         sException;
+     ...
+       9  import org.springframework.web.bind.annotation.RestControllerAd
+          vice;
+      10  
+      11  import java.time.LocalDateTime;
+      12 +import java.util.Locale;                                       
+      13  import java.util.stream.Collectors;
+      14  
+      15  /**
+      16   * Centralized exception handler for the entire application.
+      15 - * Catches specific exceptions and returns consistent JSON erro
+         -r responses.                                                   
+      17 + * Catches specific exceptions and returns consistent, localize
+         +d JSON error responses.                                        
+      18   */
+      19  @RestControllerAdvice
+      20  public class GlobalExceptionHandler {
+      21  
+      22 +    private final MessageSource messageSource;                 
+      23 +                                                               
+      24 +    public GlobalExceptionHandler(MessageSource messageSource) 
+         +{                                                              
+      25 +        this.messageSource = messageSource;                    
+      26 +    }                                                          
+      27 +                                                               
+      28      @ExceptionHandler(BadCredentialsException.class)
+      21 -    public ResponseEntity<ErrorResponse> handleBadCredentials(B
+         -adCredentialsException ex) {                                   
+      29 +    public ResponseEntity<ErrorResponse> handleBadCredentials(B
+         +adCredentialsException ex, Locale locale) {                    
+      30 +        String message = messageSource.getMessage(             
+      31 +                "error.auth.bad-credentials", null, "Invalid em
+         +ail or password", locale);                                     
+      32 +                                                               
+      33          ErrorResponse error = new ErrorResponse(
+      34                  HttpStatus.UNAUTHORIZED.value(),
+      24 -                "Invalid email or password",                   
+      35 +                message,                                       
+      36                  LocalDateTime.now()
+      37          );
+      38          return new ResponseEntity<>(error, HttpStatus.UNAUTHORI
+          ZED);
+      39      }
+      40  
+      41      @ExceptionHandler(ResourceNotFoundException.class)
+      31 -    public ResponseEntity<ErrorResponse> handleResourceNotFound
+         -(ResourceNotFoundException ex) {                               
+      42 +    public ResponseEntity<ErrorResponse> handleResourceNotFound
+         +(ResourceNotFoundException ex, Locale locale) {                
+      43 +        String entity = resolveNoun("entity", ex.getResourceNam
+         +e(), locale);                                                  
+      44 +        String field = resolveNoun("field", ex.getFieldName(), 
+         +locale);                                                       
+      45 +        String message = messageSource.getMessage(             
+      46 +                "error.resource.not-found",                    
+      47 +                new Object[]{entity, field, ex.getFieldValue()}
+         +,                                                              
+      48 +                String.format("%s not found with %s: '%s'", ent
+         +ity, field, ex.getFieldValue()),                               
+      49 +                locale);                                       
+      50 +                                                               
+      51          ErrorResponse error = new ErrorResponse(
+      52                  HttpStatus.NOT_FOUND.value(),
+      34 -                ex.getMessage(),                               
+      53 +                message,                                       
+      54                  LocalDateTime.now()
+      55          );
+      56          return new ResponseEntity<>(error, HttpStatus.NOT_FOUND
+          );
+      57      }
+      58  
+      59      @ExceptionHandler(DuplicateResourceException.class)
+      41 -    public ResponseEntity<ErrorResponse> handleDuplicateResourc
+         -e(DuplicateResourceException ex) {                             
+      60 +    public ResponseEntity<ErrorResponse> handleDuplicateResourc
+         +e(DuplicateResourceException ex, Locale locale) {              
+      61 +        String entity = resolveNoun("entity", ex.getResourceNam
+         +e(), locale);                                                  
+      62 +        String field = resolveNoun("field", ex.getFieldName(), 
+         +locale);                                                       
+      63 +        String message = messageSource.getMessage(             
+      64 +                "error.resource.already-exists",               
+      65 +                new Object[]{entity, field, ex.getFieldValue()}
+         +,                                                              
+      66 +                String.format("%s already exists with %s: '%s'"
+         +, entity, field, ex.getFieldValue()),                          
+      67 +                locale);                                       
+      68 +                                                               
+      69          ErrorResponse error = new ErrorResponse(
+      70                  HttpStatus.CONFLICT.value(),
+      44 -                ex.getMessage(),                               
+      71 +                message,                                       
+      72                  LocalDateTime.now()
+      73          );
+      74          return new ResponseEntity<>(error, HttpStatus.CONFLICT)
+          ;
+      75      }
+      76  
+      77      @ExceptionHandler(MethodArgumentNotValidException.class)
+      51 -    public ResponseEntity<ErrorResponse> handleValidationErrors
+         -(MethodArgumentNotValidException ex) {                         
+      78 +    public ResponseEntity<ErrorResponse> handleValidationErrors
+         +(MethodArgumentNotValidException ex, Locale locale) {          
+      79          String message = ex.getBindingResult().getFieldErrors()
+          .stream()
+      53 -                .map(fieldError -> fieldError.getField() + ": "
+         - + fieldError.getDefaultMessage())                             
+      80 +                .map(fieldError -> resolveNoun("field", fieldEr
+         +ror.getField(), locale)                                        
+      81 +                        + ": " + fieldError.getDefaultMessage()
+         +)                                                              
+      82                  .collect(Collectors.joining(", "));
+      83  
+      84          ErrorResponse error = new ErrorResponse(
+     ...
+       90      }
+       91  
+       92      @ExceptionHandler(Exception.class)
+       65 -    public ResponseEntity<ErrorResponse> handleGenericExceptio
+          -n(Exception ex) {                                             
+       93 +    public ResponseEntity<ErrorResponse> handleGenericExceptio
+          +n(Exception ex, Locale locale) {                              
+       94 +        String message = messageSource.getMessage(            
+       95 +                "error.generic", null, "An unexpected error oc
+          +curred", locale);                                             
+       96 +                                                              
+       97          ErrorResponse error = new ErrorResponse(
+       98                  HttpStatus.INTERNAL_SERVER_ERROR.value(),
+       68 -                "An unexpected error occurred",               
+       99 +                message,                                      
+      100                  LocalDateTime.now()
+      101          );
+      102          return new ResponseEntity<>(error, HttpStatus.INTERNAL
+           _SERVER_ERROR);
+      103      }
+      104 +                                                              
+      105 +    /** Looks up "{prefix}.{rawWord}" (e.g. "field.email"), fa
+          +lling back to rawWord if no translation exists. */            
+      106 +    private String resolveNoun(String prefix, String rawWord, 
+          +Locale locale) {                                              
+      107 +        String code = prefix + "." + rawWord.toLowerCase(Local
+          +e.ROOT);                                                      
+      108 +        return messageSource.getMessage(code, null, rawWord, l
+          +ocale);                                                       
+      109 +    }                                                         
+      110  }
+
+● Now JwtAuthEntryPoint:
+
+● Write(src\main\java\com\example\demo\security\JwtAuthEntryPoint.java)
+  ⎿  Added 25 lines, removed 6 lines
+       1  package com.example.demo.security;
+       2  
+       3 +import com.example.demo.exception.ErrorResponse;               
+       4 +import com.fasterxml.jackson.databind.ObjectMapper;            
+       5  import jakarta.servlet.http.HttpServletRequest;
+       6  import jakarta.servlet.http.HttpServletResponse;
+       7  
+       8 +import org.springframework.context.MessageSource;              
+       9 +import org.springframework.http.HttpStatus;                    
+      10  import org.springframework.http.MediaType;
+      11  import org.springframework.security.core.AuthenticationExceptio
+          n;
+      12  import org.springframework.security.web.AuthenticationEntryPoin
+          t;
+     ...
+      14  
+      15  import java.io.IOException;
+      16  import java.time.LocalDateTime;
+      17 +import java.util.Locale;                                       
+      18  
+      19  /**
+      20   * Handles unauthorized access attempts — returns a JSON 401 re
+          sponse
+      21   * instead of Spring Security's default redirect to a login pag
+          e.
+      22 + *                                                             
+      23 + * Runs inside the Spring Security filter chain, before Dispatc
+         +herServlet, so Spring MVC's                                    
+      24 + * Accept-Language-driven LocaleResolver isn't populated yet he
+         +re; locale is resolved directly                                
+      25 + * from the servlet request instead.                           
+      26   */
+      27  @Component
+      28  public class JwtAuthEntryPoint implements AuthenticationEntryPo
+          int {
+      29  
+      30 +    private final MessageSource messageSource;                 
+      31 +    private final ObjectMapper objectMapper;                   
+      32 +                                                               
+      33 +    public JwtAuthEntryPoint(MessageSource messageSource, Objec
+         +tMapper objectMapper) {                                        
+      34 +        this.messageSource = messageSource;                    
+      35 +        this.objectMapper = objectMapper;                      
+      36 +    }                                                          
+      37 +                                                               
+      38      @Override
+      39      public void commence(HttpServletRequest request,
+      40                           HttpServletResponse response,
+     ...
+      43          response.setContentType(MediaType.APPLICATION_JSON_VALU
+          E);
+      44          response.setStatus(HttpServletResponse.SC_UNAUTHORIZED)
+          ;
+      45  
+      29 -        String json = String.format(                           
+      30 -                "{\"status\":401,\"message\":\"Unauthorized: %s
+         -\",\"timestamp\":\"%s\"}",                                     
+      31 -                authException.getMessage(),                    
+      32 -                LocalDateTime.now()                            
+      33 -        );                                                     
+      46 +        Locale locale = request.getLocale();                   
+      47 +        String message = messageSource.getMessage("error.unauth
+         +orized", null, "Unauthorized", locale);                        
+      48  
+      35 -        response.getWriter().write(json);                      
+      49 +        ErrorResponse error = new ErrorResponse(               
+      50 +                HttpStatus.UNAUTHORIZED.value(),               
+      51 +                message,                                       
+      52 +                LocalDateTime.now());                          
+      53 +                                                               
+      54 +        objectMapper.writeValue(response.getWriter(), error);  
+      55      }
+      56  }
+
+  Searched for 1 pattern (ctrl+o to expand)
+● Good, no existing test to update there. Now RateLimitingFilter:
+
+● Update(src\main\java\com\example\demo\security\RateLimitingFilter.java)
+  ⎿  Added 2 lines
+       8  import jakarta.servlet.http.HttpServletRequest;
+       9  import jakarta.servlet.http.HttpServletResponse;
+      10  import org.springframework.beans.factory.annotation.Value;
+      11 +import org.springframework.context.MessageSource;              
+      12  import org.springframework.http.HttpStatus;
+      13  import org.springframework.http.MediaType;
+      14  import org.springframework.lang.NonNull;
+     ...
+      21  import java.io.IOException;
+      22  import java.time.Clock;
+      23  import java.time.LocalDateTime;
+      24 +import java.util.Locale;                                       
+      25  import java.util.concurrent.ConcurrentHashMap;
+      26  
+      27  /**
+
+● Update(src\main\java\com\example\demo\security\RateLimitingFilter.java)
+  ⎿  Added 4 lines, removed 1 line
+      38      private final boolean trustForwardedHeader;
+      39      private final ObjectMapper objectMapper;
+      40      private final Clock clock;
+      41 +    private final MessageSource messageSource;                 
+      42  
+      43      private final ConcurrentHashMap<String, RequestCounter> cou
+          ntersByIp = new ConcurrentHashMap<>();
+      44  
+     ...
+      47              @Value("${rate-limit.auth.window-ms}") long windowM
+          s,
+      48              @Value("${rate-limit.trust-forwarded-header:false}"
+          ) boolean trustForwardedHeader,
+      49              ObjectMapper objectMapper,
+      49 -            Clock clock) {                                     
+      50 +            Clock clock,                                       
+      51 +            MessageSource messageSource) {                     
+      52          this.maxRequests = maxRequests;
+      53          this.windowMs = windowMs;
+      54          this.trustForwardedHeader = trustForwardedHeader;
+      55          this.objectMapper = objectMapper;
+      56          this.clock = clock;
+      57 +        this.messageSource = messageSource;                    
+      58      }
+      59  
+      60      @Override
+
+● Update(src\main\java\com\example\demo\security\RateLimitingFilter.java)
+  ⎿  Error editing file
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(src\main\java\com\example\demo\security\RateLimitingFilter.java)
+  ⎿  Added 1 line, removed 1 line
+      82          if (counter.count > maxRequests) {
+      83              long retryAfterSeconds = Math.max(
+      84                      1, (long) Math.ceil((counter.windowStart + 
+          windowMs - now) / 1000.0));
+      85 -            writeTooManyRequests(response, retryAfterSeconds); 
+      85 +            writeTooManyRequests(request, response, retryAfterS
+         +econds);                                                       
+      86              return;
+      87          }
+      88  
+
+● Update(src\main\java\com\example\demo\security\RateLimitingFilter.java)
+  ⎿  Added 7 lines, removed 2 lines
+       99          return request.getRemoteAddr();
+      100      }
+      101  
+      102 -    private void writeTooManyRequests(HttpServletResponse resp
+          -onse, long retryAfterSeconds) throws IOException {            
+      102 +    private void writeTooManyRequests(                        
+      103 +            HttpServletRequest request, HttpServletResponse re
+          +sponse, long retryAfterSeconds) throws IOException {          
+      104          response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value(
+           ));
+      105          response.setHeader("Retry-After", String.valueOf(retry
+           AfterSeconds));
+      106          response.setContentType(MediaType.APPLICATION_JSON_VAL
+           UE);
+      107  
+      108 +        Locale locale = request.getLocale();                  
+      109 +        String message = messageSource.getMessage(            
+      110 +                "error.rate-limit.exceeded", null, "Too many r
+          +equests. Please try again later.", locale);                   
+      111 +                                                              
+      112          ErrorResponse error = new ErrorResponse(
+      113                  HttpStatus.TOO_MANY_REQUESTS.value(),
+      109 -                "Too many requests. Please try again later.", 
+      114 +                message,                                      
+      115                  LocalDateTime.now(clock));
+      116  
+      117          objectMapper.writeValue(response.getWriter(), error);
+
+● Now the DTOs:
+
+● Update(src\main\java\com\example\demo\dto\UserRequestDTO.java)
+  ⎿  Added 4 lines, removed 4 lines
+      17  @Builder
+      18  public class UserRequestDTO {
+      19  
+      20 -    @NotBlank(message = "Name is required")                    
+      20 +    @NotBlank(message = "{validation.name.required}")          
+      21      private String name;
+      22  
+      23 -    @NotBlank(message = "Email is required")                   
+      24 -    @Email(message = "Email must be valid")                    
+      23 +    @NotBlank(message = "{validation.email.required}")         
+      24 +    @Email(message = "{validation.email.invalid}")             
+      25      private String email;
+      26  
+      27 -    @NotBlank(message = "Password is required")                
+      27 +    @NotBlank(message = "{validation.password.required}")      
+      28      private String password;
+      29  }
+
+● Update(src\main\java\com\example\demo\dto\LoginRequestDTO.java)
+  ⎿  Added 3 lines, removed 3 lines
+      14  @AllArgsConstructor
+      15  public class LoginRequestDTO {
+      16  
+      17 -    @NotBlank(message = "Email is required")                   
+      18 -    @Email(message = "Email must be valid")                    
+      17 +    @NotBlank(message = "{validation.email.required}")         
+      18 +    @Email(message = "{validation.email.invalid}")             
+      19      private String email;
+      20  
+      21 -    @NotBlank(message = "Password is required")                
+      21 +    @NotBlank(message = "{validation.password.required}")      
+      22      private String password;
+      23  }
+
+● Now update the tests. First GlobalExceptionHandlerTest:
+
+● Write(src\test\java\com\example\demo\exception\GlobalExceptionHandlerTest.java
+       )
+  ⎿  Added 58 lines, removed 6 lines
+      1  package com.example.demo.exception;
+      2  
+      3  import org.junit.jupiter.api.Test;
+      4 +import org.springframework.context.support.ResourceBundleMessage
+        +Source;                                                         
+      5  import org.springframework.http.HttpStatus;
+      6  import org.springframework.http.ResponseEntity;
+      7  import org.springframework.security.authentication.BadCredential
+         sException;
+     ...
+       9  import org.springframework.validation.FieldError;
+      10  import org.springframework.web.bind.MethodArgumentNotValidExcep
+          tion;
+      11  
+      12 +import java.util.Locale;                                       
+      13 +                                                               
+      14  import static org.junit.jupiter.api.Assertions.*;
+      15  
+      16  class GlobalExceptionHandlerTest {
+      17  
+      15 -    private final GlobalExceptionHandler handler = new GlobalEx
+         -ceptionHandler();                                              
+      18 +    private static ResourceBundleMessageSource newMessageSource
+         +() {                                                           
+      19 +        ResourceBundleMessageSource messageSource = new Resourc
+         +eBundleMessageSource();                                        
+      20 +        messageSource.setBasename("messages");                 
+      21 +        messageSource.setDefaultEncoding("UTF-8");             
+      22 +        return messageSource;                                  
+      23 +    }                                                          
+      24  
+      25 +    private final GlobalExceptionHandler handler = new GlobalEx
+         +ceptionHandler(newMessageSource());                            
+      26 +                                                               
+      27      @Test
+      28      void handleResourceNotFound_Returns404() {
+      29          ResourceNotFoundException ex = new ResourceNotFoundExce
+          ption("User", "id", 1L);
+      30  
+      21 -        ResponseEntity<ErrorResponse> response = handler.handle
+         -ResourceNotFound(ex);                                          
+      31 +        ResponseEntity<ErrorResponse> response = handler.handle
+         +ResourceNotFound(ex, Locale.ENGLISH);                          
+      32  
+      33          assertEquals(HttpStatus.NOT_FOUND, response.getStatusCo
+          de());
+      34          assertEquals(404, response.getBody().status());
+     ...
+      36      }
+      37  
+      38      @Test
+      39 +    void handleResourceNotFound_Sinhala_ReturnsLocalizedMessage
+         +() {                                                           
+      40 +        ResourceNotFoundException ex = new ResourceNotFoundExce
+         +ption("User", "id", 1L);                                       
+      41 +                                                               
+      42 +        ResponseEntity<ErrorResponse> response =               
+      43 +                handler.handleResourceNotFound(ex, Locale.forLa
+         +nguageTag("si"));                                              
+      44 +                                                               
+      45 +        assertTrue(response.getBody().message().contains("පරිශී
+         +ලකයා"));                                                       
+      46 +        assertTrue(response.getBody().message().contains("හමු න
+         +ොවීය"));                                                       
+      47 +    }                                                          
+      48 +                                                               
+      49 +    @Test                                                      
+      50      void handleDuplicateResource_Returns409() {
+      51          DuplicateResourceException ex = new DuplicateResourceEx
+          ception("User", "email", "test@example.com");
+      52  
+      32 -        ResponseEntity<ErrorResponse> response = handler.handle
+         -DuplicateResource(ex);                                         
+      53 +        ResponseEntity<ErrorResponse> response = handler.handle
+         +DuplicateResource(ex, Locale.ENGLISH);                         
+      54  
+      55          assertEquals(HttpStatus.CONFLICT, response.getStatusCod
+          e());
+      56          assertEquals(409, response.getBody().status());
+     ...
+      58      }
+      59  
+      60      @Test
+      61 +    void handleDuplicateResource_Sinhala_ReturnsLocalizedMessag
+         +e() {                                                          
+      62 +        DuplicateResourceException ex = new DuplicateResourceEx
+         +ception("User", "email", "test@example.com");                  
+      63 +                                                               
+      64 +        ResponseEntity<ErrorResponse> response =               
+      65 +                handler.handleDuplicateResource(ex, Locale.forL
+         +anguageTag("si"));                                             
+      66 +                                                               
+      67 +        assertTrue(response.getBody().message().contains("පරිශී
+         +ලකයා"));                                                       
+      68 +        assertTrue(response.getBody().message().contains("දැනටම
+         +ත් පවතී"));                                                    
+      69 +    }                                                          
+      70 +                                                               
+      71 +    @Test                                                      
+      72      void handleBadCredentials_Returns401() {
+      73          BadCredentialsException ex = new BadCredentialsExceptio
+          n("Bad credentials");
+      74  
+      43 -        ResponseEntity<ErrorResponse> response = handler.handle
+         -BadCredentials(ex);                                            
+      75 +        ResponseEntity<ErrorResponse> response = handler.handle
+         +BadCredentials(ex, Locale.ENGLISH);                            
+      76  
+      77          assertEquals(HttpStatus.UNAUTHORIZED, response.getStatu
+          sCode());
+      78          assertEquals(401, response.getBody().status());
+     ...
+       80      }
+       81  
+       82      @Test
+       83 +    void handleBadCredentials_Sinhala_ReturnsLocalizedMessage(
+          +) {                                                           
+       84 +        BadCredentialsException ex = new BadCredentialsExcepti
+          +on("Bad credentials");                                        
+       85 +                                                              
+       86 +        ResponseEntity<ErrorResponse> response =              
+       87 +                handler.handleBadCredentials(ex, Locale.forLan
+          +guageTag("si"));                                              
+       88 +                                                              
+       89 +        assertEquals("වලංගු නොවන විද්‍යුත් තැපෑල හෝ මුරපදය", re
+          +sponse.getBody().message());                                  
+       90 +    }                                                         
+       91 +                                                              
+       92 +    @Test                                                     
+       93      void handleValidationErrors_Returns400() {
+       94          BeanPropertyBindingResult bindingResult = new BeanProp
+           ertyBindingResult(new Object(), "object");
+       95          bindingResult.addError(new FieldError("object", "email
+           ", "Email is required"));
+       96  
+       97          MethodArgumentNotValidException ex = new MethodArgumen
+           tNotValidException(null, bindingResult);
+       98  
+       57 -        ResponseEntity<ErrorResponse> response = handler.handl
+          -eValidationErrors(ex);                                        
+       99 +        ResponseEntity<ErrorResponse> response = handler.handl
+          +eValidationErrors(ex, Locale.ENGLISH);                        
+      100  
+      101          assertEquals(HttpStatus.BAD_REQUEST, response.getStatu
+           sCode());
+      102          assertEquals(400, response.getBody().status());
+     ...
+      107      void handleGenericException_Returns500() {
+      108          Exception ex = new RuntimeException("Something went wr
+           ong");
+      109  
+       68 -        ResponseEntity<ErrorResponse> response = handler.handl
+          -eGenericException(ex);                                        
+      110 +        ResponseEntity<ErrorResponse> response = handler.handl
+          +eGenericException(ex, Locale.ENGLISH);                        
+      111  
+      112          assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, respons
+           e.getStatusCode());
+      113          assertEquals(500, response.getBody().status());
+      114          assertEquals("An unexpected error occurred", response.
+           getBody().message());
+      115      }
+      116 +                                                              
+      117 +    @Test                                                     
+      118 +    void handleGenericException_Sinhala_ReturnsLocalizedMessag
+          +e() {                                                         
+      119 +        Exception ex = new RuntimeException("Something went wr
+          +ong");                                                        
+      120 +                                                              
+      121 +        ResponseEntity<ErrorResponse> response =              
+      122 +                handler.handleGenericException(ex, Locale.forL
+          +anguageTag("si"));                                            
+      123 +                                                              
+      124 +        assertEquals("අනපේක්ෂිත දෝෂයක් සිදු විය", response.get
+          +Body().message());                                            
+      125 +    }                                                         
+      126  }
+
+● Now RateLimitingFilterTest:
+
+● Update(src\test\java\com\example\demo\security\RateLimitingFilterTest.java)
+  ⎿  Added 2 lines
+       6  import jakarta.servlet.FilterChain;
+       7  import org.junit.jupiter.api.BeforeEach;
+       8  import org.junit.jupiter.api.Test;
+       9 +import org.springframework.context.MessageSource;              
+      10 +import org.springframework.context.support.ResourceBundleMessag
+         +eSource;                                                       
+      11  import org.springframework.mock.web.MockHttpServletRequest;
+      12  import org.springframework.mock.web.MockHttpServletResponse;
+      13  
+
+● Update(src\test\java\com\example\demo\security\RateLimitingFilterTest.java)
+  ⎿  Added 1 line, removed 1 line
+      34      @BeforeEach
+      35      void setUp() {
+      36          clock = new MutableClock(Instant.parse("2026-01-01T00:0
+          0:00Z"));
+      37 -        filter = new RateLimitingFilter(MAX_REQUESTS, WINDOW_MS
+         -, false, newObjectMapper(), clock);                            
+      37 +        filter = new RateLimitingFilter(MAX_REQUESTS, WINDOW_MS
+         +, false, newObjectMapper(), clock, newMessageSource());        
+      38      }
+      39  
+      40      @Test
+
+● Update(src\test\java\com\example\demo\security\RateLimitingFilterTest.java)
+  ⎿  Added 1 line, removed 1 line
+      135      @Test
+      136      void forwardedForHeader_HonoredWhenTrusted() throws Except
+           ion {
+      137          RateLimitingFilter trustingFilter =
+      138 -                new RateLimitingFilter(MAX_REQUESTS, WINDOW_MS
+          -, true, newObjectMapper(), clock);                            
+      138 +                new RateLimitingFilter(MAX_REQUESTS, WINDOW_MS
+          +, true, newObjectMapper(), clock, newMessageSource());        
+      139  
+      140          for (int i = 0; i < MAX_REQUESTS; i++) {
+      141              MockHttpServletRequest request = authRequest("1.2.
+           3.4");
+
+● Now add a new Sinhala test case and the newMessageSource() helper:
+
+● Update(src\test\java\com\example\demo\security\RateLimitingFilterTest.java)
+  ⎿  Added 23 lines
+      167          }
+      168      }
+      169  
+      170 +    @Test                                                     
+      171 +    void exceedingLimit_SinhalaAcceptLanguage_ReturnsLocalized
+          +Message() throws Exception {                                  
+      172 +        for (int i = 0; i < MAX_REQUESTS; i++) {              
+      173 +            filter.doFilter(authRequest("1.2.3.4"), new MockHt
+          +tpServletResponse(), mock(FilterChain.class));                
+      174 +        }                                                     
+      175 +                                                              
+      176 +        MockHttpServletRequest request = authRequest("1.2.3.4"
+          +);                                                            
+      177 +        request.addPreferredLocale(java.util.Locale.forLanguag
+          +eTag("si"));                                                  
+      178 +        MockHttpServletResponse response = new MockHttpServlet
+          +Response();                                                   
+      179 +        filter.doFilter(request, response, mock(FilterChain.cl
+          +ass));                                                        
+      180 +                                                              
+      181 +        assertEquals(429, response.getStatus());              
+      182 +        ErrorBody body = newObjectMapper().readValue(response.
+          +getContentAsString(), ErrorBody.class);                       
+      183 +        assertTrue(body.message.contains("ඉල්ලීම්"));         
+      184 +    }                                                         
+      185 +                                                              
+      186      private MockHttpServletRequest authRequest(String remoteAd
+           dr) {
+      187          MockHttpServletRequest request = new MockHttpServletRe
+           quest("POST", "/api/auth/login");
+      188          request.setRemoteAddr(remoteAddr);
+     ...
+      196                  .disable(SerializationFeature.WRITE_DATES_AS_T
+           IMESTAMPS);
+      197      }
+      198  
+      199 +    private static MessageSource newMessageSource() {         
+      200 +        ResourceBundleMessageSource messageSource = new Resour
+          +ceBundleMessageSource();                                      
+      201 +        messageSource.setBasename("messages");                
+      202 +        messageSource.setDefaultEncoding("UTF-8");            
+      203 +        return messageSource;                                 
+      204 +    }                                                         
+      205 +                                                              
+      206      private record ErrorBody(int status, String message, Strin
+           g timestamp) {
+      207      }
+      208  
+
+● Now let's add Accept-Language test cases to AuthControllerTest and
+  UserControllerTest.
+
+● Update(src\test\java\com\example\demo\controller\AuthControllerTest.java)
+  ⎿  Added 27 lines
+      118                          .content(objectMapper.writeValueAsStri
+           ng(request)))
+      119                  .andExpect(status().isBadRequest());
+      120      }
+      121 +                                                              
+      122 +    @Test                                                     
+      123 +    void login_BadCredentials_SinhalaAcceptLanguage_ReturnsLoc
+          +alizedMessage() throws Exception {                            
+      124 +        LoginRequestDTO loginRequest = new LoginRequestDTO("jo
+          +hn@example.com", "wrongpass");                                
+      125 +                                                              
+      126 +        when(authService.login(any(LoginRequestDTO.class)))   
+      127 +                .thenThrow(new BadCredentialsException("Bad cr
+          +edentials"));                                                 
+      128 +                                                              
+      129 +        mockMvc.perform(post("/api/auth/login")               
+      130 +                        .header("Accept-Language", "si")      
+      131 +                        .contentType(MediaType.APPLICATION_JSO
+          +N)                                                            
+      132 +                        .content(objectMapper.writeValueAsStri
+          +ng(loginRequest)))                                            
+      133 +                .andExpect(status().isUnauthorized())         
+      134 +                .andExpect(jsonPath("$.message").value("වලංගු 
+          +නොවන විද්‍යුත් තැපෑල හෝ මුරපදය"));                             
+      135 +    }                                                         
+      136 +                                                              
+      137 +    @Test                                                     
+      138 +    void register_InvalidInput_UnsupportedAcceptLanguage_Falls
+          +BackToEnglish() throws Exception {                            
+      139 +        UserRequestDTO request = new UserRequestDTO("", "not-e
+          +mail", "");                                                   
+      140 +                                                              
+      141 +        mockMvc.perform(post("/api/auth/register")            
+      142 +                        .header("Accept-Language", "fr")      
+      143 +                        .contentType(MediaType.APPLICATION_JSO
+          +N)                                                            
+      144 +                        .content(objectMapper.writeValueAsStri
+          +ng(request)))                                                 
+      145 +                .andExpect(status().isBadRequest())           
+      146 +                .andExpect(jsonPath("$.message").value(org.ham
+          +crest.Matchers.containsString("required")));                  
+      147 +    }                                                         
+      148  }
+
+● Update(src\test\java\com\example\demo\controller\UserControllerTest.java)
+  ⎿  Added 12 lines
+      140          mockMvc.perform(get("/api/users"))
+      141                  .andExpect(status().isUnauthorized());
+      142      }
+      143 +                                                              
+      144 +    @Test                                                     
+      145 +    @WithMockUser                                             
+      146 +    void getUserById_NotFound_SinhalaAcceptLanguage_ReturnsLoc
+          +alizedMessage() throws Exception {                            
+      147 +        when(userService.getUserById(999L))                   
+      148 +                .thenThrow(new ResourceNotFoundException("User
+          +", "id", 999L));                                              
+      149 +                                                              
+      150 +        mockMvc.perform(get("/api/users/999").header("Accept-L
+          +anguage", "si"))                                              
+      151 +                .andExpect(status().isNotFound())             
+      152 +                .andExpect(jsonPath("$.message", org.hamcrest.
+          +Matchers.containsString("පරිශීලකයා")))                        
+      153 +                .andExpect(jsonPath("$.message", org.hamcrest.
+          +Matchers.containsString("හමු නොවීය")));                       
+      154 +    }                                                         
+      155  }
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Good, all call sites accounted for. Now let's build and run the test suite.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● That failure is pre-existing test coupling exposed by adding more test
+  methods: AuthControllerTest's shared Spring context reuses the same
+  RateLimitingFilter singleton across all its @Test methods, and they all hit
+  /api/auth/** from the same mock remote address — the existing 5 auth-hitting
+  tests exactly matched the default rate-limit.auth.max-requests=5, and my 2 new
+  ones pushed it over. I'll raise the limit for this test class via
+  @TestPropertySource since rate-limiting itself is already covered by the
+  dedicated RateLimitingFilterTest.
+
+● Update(src\test\java\com\example\demo\controller\AuthControllerTest.java)
+  ⎿  Added 1 line
+      20  import org.springframework.context.annotation.Import;
+      21  import org.springframework.http.MediaType;
+      22  import org.springframework.security.authentication.BadCredentia
+          lsException;
+      23 +import org.springframework.test.context.TestPropertySource;    
+      24  import org.springframework.test.context.bean.override.mockito.M
+          ockitoBean;
+      25  import org.springframework.test.web.servlet.MockMvc;
+      26  
+
+● Update(src\test\java\com\example\demo\controller\AuthControllerTest.java)
+  ⎿  Added 1 line
+      33  
+      34  @WebMvcTest(AuthController.class)
+      35  @Import({SecurityConfig.class, JwtAuthenticationFilter.class, J
+          wtAuthEntryPoint.class, AppConfig.class})
+      36 +@TestPropertySource(properties = "rate-limit.auth.max-requests=
+         +1000")                                                         
+      37  class AuthControllerTest {
+      38  
+      39      @Autowired
+
+● Now re-run the test suite.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● All 57 tests pass. Let's run the full verify (JaCoCo) and then a quick manual
+  smoke test.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Now let's do a manual end-to-end smoke test to confirm real HTTP behavior, not
+  just mocked slices.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Background command "Start the Spring Boot app in background for manual smoke
+test" completed (exit code 0)
+
+● App is live. Running the verification sequence now.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● That's the old message format — likely a stale process left over from an
+  earlier session still bound to port 8080. Let me check.
+
+  Read 1 file, ran 4 shell commands (ctrl+o to expand)
+
+● No Java process is running now — the port has since freed up. Let me restart
+  the app fresh and redo the verification.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Background command "Start the Spring Boot app fresh" completed (exit code 0)
+
+● App started successfully. Re-running the smoke tests now.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Real bug found: JwtAuthEntryPoint and RateLimitingFilter write via
+  response.getWriter() without setting UTF-8 character encoding, so it defaults
+  to ISO-8859-1 and mangles the Sinhala text (GlobalExceptionHandler's path is
+  fine because Spring MVC's Jackson converter writes UTF-8 bytes directly).
+  Fixing both.
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(src\main\java\com\example\demo\security\JwtAuthEntryPoint.java)
+  ⎿  Added 1 line
+      41                           AuthenticationException authException)
+           throws IOException {
+      42  
+      43          response.setContentType(MediaType.APPLICATION_JSON_VALU
+          E);
+      44 +        response.setCharacterEncoding("UTF-8");                
+      45          response.setStatus(HttpServletResponse.SC_UNAUTHORIZED)
+          ;
+      46  
+      47          Locale locale = request.getLocale();
+  Read 1 file (ctrl+o to expand)
+
+● Update(src\main\java\com\example\demo\security\RateLimitingFilter.java)
+  ⎿  Added 1 line
+      104          response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value(
+           ));
+      105          response.setHeader("Retry-After", String.valueOf(retry
+           AfterSeconds));
+      106          response.setContentType(MediaType.APPLICATION_JSON_VAL
+           UE);
+      107 +        response.setCharacterEncoding("UTF-8");               
+      108  
+      109          Locale locale = request.getLocale();
+      110          String message = messageSource.getMessage(
+
+● Now rebuild and restart the app to verify.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All tests still pass. Now let's stop the old app process and restart with the
+  fix.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Both stopped. Restarting with the fix.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Background command "Restart the Spring Boot app with the UTF-8 encoding fix"
+completed (exit code 0)
+
+● Both now render correctly. Let's stop the app cleanly.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● App stopped cleanly.
+
+  Summary
+
+  Implemented i18n across the API, driven by the Accept-Language header,
+  supporting English (default) and Sinhala (si):
+
+  - New: messages.properties / messages_si.properties bundles, plus
+  application.properties config (spring.messages.*, spring.web.locale*) — no new
+  @Bean needed, Spring Boot autoconfigures MessageSource/LocaleResolver from
+  these.
+  - Modified: GlobalExceptionHandler (locale-aware, translates embedded nouns
+  like "User"/"email" with English fallback),
+  ResourceNotFoundException/DuplicateResourceException (expose raw fields for
+  translation), JwtAuthEntryPoint and RateLimitingFilter (resolve locale via
+  request.getLocale() since they run before DispatcherServlet; JwtAuthEntryPoint
+  also now uses ErrorResponse+ObjectMapper instead of hand-rolled JSON), and
+  the two DTOs' validation messages now reference bundle keys.
+  - Tests: updated GlobalExceptionHandlerTest/RateLimitingFilterTest for the new
+  constructor params plus new Sinhala assertions; added Sinhala/fallback cases
+  to AuthControllerTest/UserControllerTest.
+
+  Two real bugs surfaced and were fixed during verification (not just
+  theoretical — confirmed via live curl):
+  1. AuthControllerTest's shared rate-limiter singleton meant adding 2 test
+  methods pushed the auth-endpoint hit count over the default limit of 5 → fixed
+  via @TestPropertySource raising the test-class limit.
+  2. JwtAuthEntryPoint/RateLimitingFilter wrote JSON via response.getWriter()
+  without setting UTF-8 character encoding, so Sinhala text was silently mangled
+  to ????? — fixed by adding response.setCharacterEncoding("UTF-8") to both.
+
+  All 57 tests pass, mvnw verify (JaCoCo) succeeds, and manual curl checks
+  confirm correct English/Sinhala/fallback behavior end-to-end, including the
+  rate-limit and unauthorized paths.
+
+✻ Worked for 1h 2m 32s
+
+❯ I need to check this implementation using postman. Give me the steps and      
+  commands needed for that                                                      
+
+● Here's how to verify the i18n behavior in Postman, step by step.
+
+  1. Start the app
+
+  In a terminal (leave it running):
+  ./mvnw spring-boot:run
+  Wait for Started DemoApplication in the logs. Base URL for all requests below:
+  http://localhost:8080.
+
+  2. Register a user (creates test data + shows validation messages)
+
+  POST http://localhost:8080/api/auth/register
+  Headers: Content-Type: application/json
+  Body (raw JSON):
+  {"name": "John Doe", "email": "john@example.com", "password": "pass123"}
+  Expect: 201 Created.
+
+  Test validation messages — resend with an empty body {}:
+  - No Accept-Language header → English: "name: Name is required, email: Email 
+  is required, ..."
+  - Add header Accept-Language: si → Sinhala text (නම අවශ්‍යයි, etc.)
+  - Add header Accept-Language: fr → falls back to English (unsupported locale)
+
+  3. Login (get a JWT + test bad-credentials message)
+
+  POST http://localhost:8080/api/auth/login
+  Headers: Content-Type: application/json
+  Body:
+  {"email": "john@example.com", "password": "pass123"}
+  Expect 200 with {"token": "...", "tokenType": "Bearer"}. Copy the token —
+  you'll need it for step 5.
+
+  Test bad-credentials message — resend with wrong password, once with no header
+  (English "Invalid email or password") and once with Accept-Language: si
+  (Sinhala).
+
+  4. Unauthenticated access (JwtAuthEntryPoint)
+
+  GET http://localhost:8080/api/users — no Authorization header.
+  - No Accept-Language → {"message":"Unauthorized", ...}
+  - Accept-Language: si → Sinhala "අනවසර..." message
+
+  5. Resource-not-found (needs auth)
+
+  GET http://localhost:8080/api/users/99999
+  Headers: Authorization: Bearer <token from step 3>, Accept-Language: si
+  Expect 404 with message containing පරිශීලකයා ... හමු නොවීය. Drop the
+  Accept-Language header to see the English version.
+
+  6. Duplicate resource
+
+  POST http://localhost:8080/api/auth/register again with the same email as step
+  2, Accept-Language: si header.
+  Expect 409 with Sinhala "already exists" message.
+
+  7. Rate limiting (429 + Retry-After)
+
+  Same request as step 3 (or register), fired 6 times quickly (default limit is
+  5/60s). In Postman, easiest way:
+  - Save the login request, then use the Runner (or just click Send 6 times
+  fast) — the 6th response should be 429 with header Retry-After and a localized
+  body.
+  - Add Accept-Language: si on that 6th request to see the Sinhala rate-limit
+  message.
+
+  Quick reference table
+
+  ┌─────────────┬────────────────────┬─────────────────┬───────────────────┐
+  │  Scenario   │     Method/URL     │   Key header    │      Expect       │
+  ├─────────────┼────────────────────┼─────────────────┼───────────────────┤
+  │ Validation  │ POST /api/auth/reg │ Accept-Language │ 400, localized/fa │
+  │ error       │ ister, body {}     │ : si / fr /     │ llback message    │
+  │             │                    │ none            │                   │
+  ├─────────────┼────────────────────┼─────────────────┼───────────────────┤
+  │ Bad         │ POST               │ Accept-Language │ 401, Sinhala      │
+  │ credentials │ /api/auth/login,   │ : si            │ message           │
+  │             │ wrong password     │                 │                   │
+  ├─────────────┼────────────────────┼─────────────────┼───────────────────┤
+  │ Unauthorize │ GET /api/users, no │ Accept-Language │ 401, Sinhala      │
+  │ d           │  token             │ : si            │ "Unauthorized"    │
+  ├─────────────┼────────────────────┼─────────────────┼───────────────────┤
+  │             │ GET                │ Accept-Language │ 404, Sinhala      │
+  │ Not found   │ /api/users/99999,  │ : si            │ message           │
+  │             │ with token         │                 │                   │
+  ├─────────────┼────────────────────┼─────────────────┼───────────────────┤
+  │             │ POST /api/auth/reg │ Accept-Language │ 409, Sinhala      │
+  │ Duplicate   │ ister, existing    │ : si            │ message           │
+  │             │ email              │                 │                   │
+  ├─────────────┼────────────────────┼─────────────────┼───────────────────┤
+  │             │ 6x POST            │ Accept-Language │ 429 +             │
+  │ Rate limit  │ /api/auth/login    │ : si on 6th     │ Retry-After,      │
+  │             │ rapidly            │                 │ Sinhala message   │
+  └─────────────┴────────────────────┴─────────────────┴───────────────────┘
+
+  If you want, I can generate a ready-to-import Postman collection JSON with all
+  these requests pre-built instead of setting them up by hand — just say so.
+
+✻ Cooked for 29s
+
+❯ Can you give me the flow how requests come and the ratelimiting happens. Tell 
+  me file wise where the requests come and how it will block the requests       
+  after certain amount of time                                                  
+
+  Read 2 files (ctrl+o to expand)
+
+● Request flow
+
+  Client
+    │  POST /api/auth/login  (or /api/auth/register)
+    ▼
+  Tomcat (embedded servlet container)
+    │
+    ▼
+  Servlet Filter Chain (order fixed at startup by SecurityConfig.java:70-72)
+    │
+    ├─▶ 1. RateLimitingFilter        ← runs FIRST for /api/auth/** (blocks here
+  if over limit)
+    ├─▶ 2. JwtAuthenticationFilter   ← parses/validates JWT (skipped anyway for
+  /api/auth/**, it's permitAll)
+    ├─▶ 3. Spring Security authorization check
+    ▼
+  DispatcherServlet → AuthController → AuthService → response
+
+  Only requests to /api/auth/** ever reach the counting logic — everything else
+  (/api/users/** etc.) skips RateLimitingFilter entirely.
+
+  File 1: SecurityConfig.java — where it's wired into the chain
+
+  public static final String AUTH_PATH_PATTERN = "/api/auth/**";   // line 29
+  ...
+  .addFilterBefore(jwtAuthenticationFilter,
+  UsernamePasswordAuthenticationFilter.class)  // line 70-71
+  .addFilterBefore(rateLimitingFilter, JwtAuthenticationFilter.class);
+           // line 72
+  The second line places RateLimitingFilter before JwtAuthenticationFilter in
+  the chain — so a request gets rejected (or counted) before the app spends any
+  effort parsing a JWT. This is the only file that decides where in the pipeline
+  the check happens; it doesn't do any counting itself.
+
+  File 2: RateLimitingFilter.java — where the actual blocking happens
+
+  Step A — is this even a path we care about?
+  protected boolean shouldNotFilter(HttpServletRequest request) {
+      return !PATH_MATCHER.match(SecurityConfig.AUTH_PATH_PATTERN,
+  request.getRequestURI());
+  }
+  (line 61-63) If the URL isn't /api/auth/..., the filter does nothing and the
+  request passes straight through.
+
+  Step B — identify the caller and look up their counter
+  String ip = resolveClientIp(request);      // line 71 — 
+  request.getRemoteAddr() by default
+  long now = clock.millis();                 // line 72 — current time
+
+  RequestCounter counter = countersByIp.compute(ip, (key, existing) -> {   // 
+  lines 74-80
+      if (existing == null || now - existing.windowStart >= windowMs) {
+          return new RequestCounter(now, 1);   // no record yet, or the old 
+  window expired → start a fresh window
+      }
+      existing.count++;                        // still inside the same window →
+  just add one
+      return existing;
+  });
+  countersByIp is an in-memory map (ConcurrentHashMap<String, RequestCounter>) —
+  one entry per IP address, living only in this server's RAM. RequestCounter
+  just holds windowStart (when this IP's current 60-second window began) and
+  count (how many hits so far in it).
+
+  Step C — decide: let through, or block?
+  if (counter.count > maxRequests) {                                    // line 
+  82
+      long retryAfterSeconds = Math.max(
+              1, (long) Math.ceil((counter.windowStart + windowMs - now) /
+  1000.0));   // lines 83-84
+      writeTooManyRequests(request, response, retryAfterSeconds);         // 
+  line 85
+      return;   // <-- filterChain.doFilter() is NEVER called, so the request 
+  stops here
+  }
+  filterChain.doFilter(request, response);   // line 89 — under the limit, 
+  continue to JwtAuthenticationFilter/controller
+
+  Concrete example with the current defaults
+
+  From application.properties: rate-limit.auth.max-requests=5,
+  rate-limit.auth.window-ms=60000 (5 requests per 60 seconds, per IP).
+
+  ┌───────┬──────────────┬────────────────────────────┬────────────────────┐
+  │       │  Request #   │                            │                    │
+  │ Time  │   from IP    │       counter.count        │       Result       │
+  │       │   1.2.3.4    │                            │                    │
+  ├───────┼──────────────┼────────────────────────────┼────────────────────┤
+  │ t=0s  │ 1st login    │ 1 (new window starts at    │ ✅ passes          │
+  │       │ attempt      │ t=0)                       │                    │
+  ├───────┼──────────────┼────────────────────────────┼────────────────────┤
+  │ t=5s  │ 2nd          │ 2                          │ ✅ passes          │
+  ├───────┼──────────────┼────────────────────────────┼────────────────────┤
+  │ t=10s │ 3rd          │ 3                          │ ✅ passes          │
+  ├───────┼──────────────┼────────────────────────────┼────────────────────┤
+  │ t=15s │ 4th          │ 4                          │ ✅ passes          │
+  ├───────┼──────────────┼────────────────────────────┼────────────────────┤
+  │ t=20s │ 5th          │ 5                          │ ✅ passes          │
+  ├───────┼──────────────┼────────────────────────────┼────────────────────┤
+  │       │              │                            │ ❌ 429,            │
+  │ t=25s │ 6th          │ 6 → 6 > 5                  │ Retry-After: 35    │
+  │       │              │                            │ (60 − 25)          │
+  ├───────┼──────────────┼────────────────────────────┼────────────────────┤
+  │ t=30s │ 7th          │ 7 → 7 > 5                  │ ❌ 429,            │
+  │       │              │                            │ Retry-After: 30    │
+  ├───────┼──────────────┼────────────────────────────┼────────────────────┤
+  │       │              │ window is now 61 − 0 = 61  │                    │
+  │ t=61s │ next request │ ≥ 60, so it resets to      │ ✅ passes again    │
+  │       │              │ count=1                    │                    │
+  └───────┴──────────────┴────────────────────────────┴────────────────────┘
+
+  So "blocking after a certain amount of time" isn't a ban — it's a rolling
+  quota: once the 60-second window that started with the first request in the
+  burst has fully elapsed, the very next request for that IP starts a brand-new
+  window and counting begins from 1 again.
+
+  The 429 response itself
+
+  private void writeTooManyRequests(HttpServletRequest request,
+  HttpServletResponse response, long retryAfterSeconds) {
+      response.setStatus(429);
+      response.setHeader("Retry-After", String.valueOf(retryAfterSeconds));   //
+  tells the client when to retry
+      ...
+      String message = messageSource.getMessage("error.rate-limit.exceeded",
+  ..., request.getLocale());  // i18n
+      objectMapper.writeValue(response.getWriter(), error);
+  // {"status":429,"message":"...","timestamp":"..."}
+  }
+
+  Memory cleanup (separate from blocking)
+
+  @Scheduled(fixedRateString = "${rate-limit.cleanup-interval-ms:300000}")   // 
+  every 5 min by default
+  void purgeExpiredCounters() {
+      countersByIp.entrySet().removeIf(entry -> now -
+  entry.getValue().windowStart > windowMs * 2);
+  }
+  This just deletes old, unused IP entries from the map every 5 minutes so
+  memory doesn't grow forever — it has no effect on whether a request is
+  blocked, since a request either finds its window still valid or creates a
+  fresh one regardless of whether cleanup has run.
+
+✻ Worked for 48s

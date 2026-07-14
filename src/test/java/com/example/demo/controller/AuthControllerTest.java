@@ -1,5 +1,6 @@
 package com.example.demo.controller;
 
+import com.example.demo.config.AppConfig;
 import com.example.demo.config.SecurityConfig;
 
 import com.example.demo.dto.AuthResponseDTO;
@@ -19,6 +20,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.security.authentication.BadCredentialsException;
+import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
@@ -30,7 +32,8 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 @WebMvcTest(AuthController.class)
-@Import({SecurityConfig.class, JwtAuthenticationFilter.class, JwtAuthEntryPoint.class})
+@Import({SecurityConfig.class, JwtAuthenticationFilter.class, JwtAuthEntryPoint.class, AppConfig.class})
+@TestPropertySource(properties = "rate-limit.auth.max-requests=1000")
 class AuthControllerTest {
 
     @Autowired
@@ -116,5 +119,32 @@ class AuthControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void login_BadCredentials_SinhalaAcceptLanguage_ReturnsLocalizedMessage() throws Exception {
+        LoginRequestDTO loginRequest = new LoginRequestDTO("john@example.com", "wrongpass");
+
+        when(authService.login(any(LoginRequestDTO.class)))
+                .thenThrow(new BadCredentialsException("Bad credentials"));
+
+        mockMvc.perform(post("/api/auth/login")
+                        .header("Accept-Language", "si")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(loginRequest)))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.message").value("වලංගු නොවන විද්‍යුත් තැපෑල හෝ මුරපදය"));
+    }
+
+    @Test
+    void register_InvalidInput_UnsupportedAcceptLanguage_FallsBackToEnglish() throws Exception {
+        UserRequestDTO request = new UserRequestDTO("", "not-email", "");
+
+        mockMvc.perform(post("/api/auth/register")
+                        .header("Accept-Language", "fr")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("required")));
     }
 }

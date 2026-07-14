@@ -2,6 +2,7 @@ package com.example.demo.config;
 
 import com.example.demo.security.JwtAuthEntryPoint;
 import com.example.demo.security.JwtAuthenticationFilter;
+import com.example.demo.security.RateLimitingFilter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -24,8 +25,12 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @RequiredArgsConstructor
 public class SecurityConfig {
 
+    /** Shared path pattern for the public auth endpoints, also used to scope rate limiting. */
+    public static final String AUTH_PATH_PATTERN = "/api/auth/**";
+
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final JwtAuthEntryPoint jwtAuthEntryPoint;
+    private final RateLimitingFilter rateLimitingFilter;
 
     /** BCrypt password encoder used for hashing user passwords. */
     @Bean
@@ -59,11 +64,12 @@ public class SecurityConfig {
                         .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
                 )
                 .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/api/auth/**").permitAll()
+                        .requestMatchers(AUTH_PATH_PATTERN).permitAll()
                         .anyRequest().authenticated()
                 )
                 .addFilterBefore(jwtAuthenticationFilter,
-                        UsernamePasswordAuthenticationFilter.class);
+                        UsernamePasswordAuthenticationFilter.class)
+                .addFilterBefore(rateLimitingFilter, JwtAuthenticationFilter.class);
 
         return http.build();
     }

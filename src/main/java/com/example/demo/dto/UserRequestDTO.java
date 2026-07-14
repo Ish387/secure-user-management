@@ -17,13 +17,13 @@ import lombok.NoArgsConstructor;
 @Builder
 public class UserRequestDTO {
 
-    @NotBlank(message = "Name is required")
+    @NotBlank(message = "{validation.name.required}")
     private String name;
 
-    @NotBlank(message = "Email is required")
-    @Email(message = "Email must be valid")
+    @NotBlank(message = "{validation.email.required}")
+    @Email(message = "{validation.email.invalid}")
     private String email;
 
-    @NotBlank(message = "Password is required")
+    @NotBlank(message = "{validation.password.required}")
     private String password;
 }
